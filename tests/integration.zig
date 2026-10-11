@@ -4570,6 +4570,7 @@ test "motion: every level arrives on time, and passes through without a kink" {
 // when it resumes. The sequencing rules themselves are unit-tested in `sdk/tape/`.
 
 const automation = @import("app").automation;
+const ExecutableWatcher = @import("app").watch.ExecutableWatcher;
 
 const DemoStage = struct {
     keyframes: usize = 0,
@@ -6708,6 +6709,11 @@ test "headless: the whole editor comes up, opens a file, plays the tour and goes
     // minute of demo in a few hundred frames.
     // Measured while it plays, with no profiler window open: what each plugin cost, by name.
     fizzy.core.profile.want(60_000);
+    // Every frame of it a hitch, so the lookback keeps some whatever this machine's speed.
+    _ = try dvui.testing.step(headlessFrame);
+    const lookback = fizzy.core.profile.lookback() orelse return error.TestUnexpectedResult;
+    lookback.budget_ns = 0;
+    defer lookback.budget_ns = std.time.ns_per_s / 60;
     try editor.demo.play("tour");
     var frames: usize = 0;
     while (editor.demo.player.state != .ended and frames < 5000) : (frames += 1) {
@@ -6717,8 +6723,13 @@ test "headless: the whole editor comes up, opens a file, plays the tour and goes
     {
         var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer out.deinit();
-        try fizzy.core.profile.report(fizzy.core.profile.host(), &out.writer, .{ .min_ms = 0 });
+        try fizzy.core.profile.report(fizzy.core.profile.host(), &out.writer, .{ .min_ms = 0, .over_ms = 30_000, .hitches = 3 });
         const profiled = out.written();
+        // Past the half second: the costliest scopes over the last 30 s, and the frames that
+        // went over budget, each with what it spent.
+        try std.testing.expect(std.mem.indexOf(u8, profiled, ".over = .{ .seconds = ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, profiled, ".hitch_budget_ms = 0.000") != null);
+        try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, profiled, ".ago_s = "));
         try std.testing.expect(std.mem.indexOf(u8, profiled, ".frame = .{ .fps = ") != null);
         try std.testing.expect(std.mem.indexOf(u8, profiled, ".owner = \"fizzy\"") != null);
         // The plugins drawing the tour, each under its own name.
@@ -6828,6 +6839,25 @@ test "headless: the whole editor comes up, opens a file, plays the tour and goes
         try std.testing.expectEqual(@as(u32, 1), st.failures);
         editor.app.noteLoadTimes("text", 180, 6);
         try std.testing.expectEqual(@as(f32, 6), plugins.status("text").swapped_ms);
+
+        // Who each plugin is and what it brought: the text plugin, bundled in this harness, with
+        // the commands it registered; the app's own internal plugins left out.
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const all = try plugins.list(arena.allocator());
+        const text_info = for (all) |info| {
+            if (std.mem.eql(u8, info.id, "text")) break info;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(sdk.services.plugins.Api.Link.bundled, text_info.link);
+        try std.testing.expect(text_info.registered.commands > 0);
+        try std.testing.expectEqual(sdk.services.plugins.Api.State.loaded, text_info.status.state);
+        for (all) |info| {
+            const p = editor.app.host.pluginById(info.id) orelse continue;
+            try std.testing.expect(!p.internal);
+        }
+        try std.testing.expect(for (all) |info| {
+            if (std.mem.eql(u8, info.id, "workbench")) break info.registered.surfaces > 0;
+        } else false);
     }
 
     // A plugin's reload keeps its open documents (`KeptDocuments`): captured, detached with their
@@ -6896,7 +6926,87 @@ test "headless: the whole editor comes up, opens a file, plays the tour and goes
         editor.session = null;
     }
 
+    // A checkpoint (`Checkpoint`): what a run that did not quit cleanly left is read once at the
+    // next launch. Each write is a generation of files in the same folder (`saveGeneration`), the
+    // last one's removed once the new `session.zon` is in place; one cut off before any
+    // `session.zon` is neither read nor kept; and a restart's session, which is newer, wins.
+    {
+        const Checkpoint = fizzy.Editor.Checkpoint;
+        const config = editor.app.config_folder;
+        const dir = try Checkpoint.dir(gpa, config);
+        defer gpa.free(dir);
+        const cwd = std.Io.Dir.cwd();
+        {
+            var kept = try fizzy.Editor.KeptDocuments.capture(editor, null);
+            defer kept.deinit();
+            try kept.saveGeneration(dir, 1);
+            try kept.saveGeneration(dir, 2);
+        }
+        // Only the second generation's files are left, beside its `session.zon`.
+        {
+            var d = try cwd.openDir(dvui.io, dir, .{ .iterate = true });
+            defer d.close(dvui.io);
+            var it = d.iterate();
+            while (try it.next(dvui.io)) |file| {
+                try std.testing.expect(std.mem.eql(u8, file.name, "session.zon") or std.mem.startsWith(u8, file.name, "2-"));
+            }
+        }
+        var recovered = Checkpoint.recover(gpa, config, false) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(recovered.docs.items.len > 0);
+        try std.testing.expect(recovered.docs.items[0].state != null);
+        recovered.deinit();
+        try std.testing.expectError(error.FileNotFound, cwd.access(dvui.io, dir, .{}));
+        try std.testing.expect(Checkpoint.recover(gpa, config, false) == null);
+
+        // Cut off before its first `session.zon`: nothing read, and nothing left.
+        try cwd.createDirPath(dvui.io, dir);
+        try std.testing.expect(Checkpoint.recover(gpa, config, false) == null);
+        try std.testing.expectError(error.FileNotFound, cwd.access(dvui.io, dir, .{}));
+
+        // A restart's session found: the checkpoint is older, and goes unread.
+        {
+            var kept = try fizzy.Editor.KeptDocuments.capture(editor, null);
+            defer kept.deinit();
+            try kept.saveGeneration(dir, 1);
+        }
+        try std.testing.expect(Checkpoint.recover(gpa, config, true) == null);
+        try std.testing.expectError(error.FileNotFound, cwd.access(dvui.io, dir, .{}));
+    }
+
     try editor.deinit();
+}
+
+// ── The app's own executable ────────────────────────────────────────────────────────────────────
+// `ExecutableWatcher.tick`: when a replaced executable is a rebuild to restart into (the watcher's
+// thread is nightwatch's, which sets the same flag the test sets).
+
+test "executable watcher: a rebuild is a replaced executable that has held still" {
+    if (comptime !ExecutableWatcher.have_impl) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io_before = dvui.io;
+    defer dvui.io = io_before;
+    dvui.io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(dvui.io, .{ .sub_path = "app", .data = "the launched build" });
+    const path = try std.fs.path.join(gpa, &.{ ".zig-cache", "tmp", &tmp.sub_path, "app" });
+    defer gpa.free(path);
+    var w = try ExecutableWatcher.init(gpa, path);
+    defer w.deinit();
+
+    // An event for an executable that did not change (touched by a no-op install): no restart.
+    w.dirty.store(true, .release);
+    try std.testing.expect(!w.tick());
+    w.pending_ns -= ExecutableWatcher.settle_ns;
+    try std.testing.expect(!w.tick());
+
+    // Replaced, as an install does it: written beside it, renamed into place.
+    try tmp.dir.writeFile(dvui.io, .{ .sub_path = "app.new", .data = "the rebuilt build, longer" });
+    try tmp.dir.rename("app.new", tmp.dir, "app", dvui.io);
+    w.dirty.store(true, .release);
+    try std.testing.expect(!w.tick()); // settling
+    w.pending_ns -= ExecutableWatcher.settle_ns;
+    try std.testing.expect(w.tick());
 }
 
 // ── The automation service ──────────────────────────────────────────────────────────────────────

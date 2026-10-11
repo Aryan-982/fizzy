@@ -426,6 +426,12 @@ pub fn construct(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         const install_artifact = b.addInstallArtifact(exe, .{
             .dest_dir = .{ .override = zig_out_install_dir },
         });
+        // A running fizzy holds its executable on Windows: set it aside first, or the install fails.
+        if (b.graph.host.result.os.tag == .windows and target.result.os.tag == .windows) {
+            const aside = SetAsideRunningExe.create(b, b.getInstallPath(zig_out_install_dir, exe.out_filename));
+            aside.step.dependOn(&exe.step);
+            install_artifact.step.dependOn(&aside.step);
+        }
 
         const run_cmd = b.addRunArtifact(exe);
         const run_step = b.step("run", "Run the app (does not run Velopack)");
@@ -558,6 +564,10 @@ pub fn construct(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .{ "fizzy-paths-tests", "core/paths.zig" },
         // `core.viz`'s arithmetic: a chart's scale, the slot under the pointer, a bar's fill.
         .{ "fizzy-viz-scale-tests", "core/viz/scale.zig" },
+        // The profiler's lookback: 30 seconds of windows a reader can sum over, and the frames
+        // that went over budget.
+        .{ "fizzy-profile-lookback-tests", "core/profile/Lookback.zig" },
+        .{ "fizzy-profile-causes-tests", "core/profile/FrameCauses.zig" },
         // The login-shell PATH cache: it owns its string whatever allocator the first caller
         // passed, and threads that ask at once resolve once. The shell spawn itself is not run.
         .{ "fizzy-shell-env-tests", "core/shell_env.zig" },
@@ -667,6 +677,19 @@ pub fn construct(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             .target = target,
             .optimize = optimize,
             .root_source_file = b.path("libs/dvui-singleton-app/src/unix_impl.zig"),
+            .link_libc = true,
+        }),
+        .filters = test_filters,
+    }));
+
+    // Crash reports: the report's text, and the image (range, build id) holding an address.
+    // std-only; it reads images and writes the report through libc.
+    try unit_test_artifacts.append(b.allocator, b.addTest(.{
+        .name = "fizzy-crash-tests",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("app/crash/crash.zig"),
             .link_libc = true,
         }),
         .filters = test_filters,
@@ -1216,6 +1239,7 @@ pub fn construct(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         });
         plugin_loader_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
         plugin_loader_module.addImport("fizzy_sdk", sdk_module_test);
+        plugin_loader_module.addImport("crash", sdk.crashModule(b, target, optimize));
 
         // How big a pane is: the split's drag, capture handoff and hit distance, and the pane
         // row's shares. Both need a real Window — every bug either has had was a dvui
@@ -1346,3 +1370,45 @@ pub fn construct(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         }
     }
 }
+
+/// Windows will not let a file a running process was started from be written or deleted, but it
+/// will let it be renamed. So before the install, an installed executable that is running (it
+/// cannot be opened for writing) is renamed aside, to `<name>.<time>.old` beside it. The running
+/// app goes on from the renamed file; with Restart when rebuilt on it sees the new one land and
+/// restarts into it, and the next launch deletes what was set aside
+/// (`ExecutableWatcher.removeSetAside`). An executable nothing runs is left for the install to
+/// replace as it always has. Only on a Windows host, the one with the lock, and only once the
+/// compile has succeeded, so a failed build leaves the running app's file where it was.
+const SetAsideRunningExe = struct {
+    step: std.Build.Step,
+    path: []const u8,
+
+    fn create(b: *std.Build, path: []const u8) *SetAsideRunningExe {
+        const self = b.allocator.create(SetAsideRunningExe) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{ .id = .custom, .name = "set aside a running executable", .owner = b, .makeFn = make }),
+            .path = path,
+        };
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) anyerror!void {
+        const self: *SetAsideRunningExe = @fieldParentPtr("step", step);
+        const io = step.owner.graph.io;
+        const cwd = std.Io.Dir.cwd();
+        var file = cwd.openFile(io, self.path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => {
+                // Held: a running app. Renamed, the install's path is free.
+                const aside = try std.fmt.allocPrint(step.owner.allocator, "{s}.{d}.old", .{ self.path, std.Io.Clock.real.now(io).nanoseconds });
+                std.Io.Dir.renameAbsolute(self.path, aside, io) catch |rename_err| {
+                    std.log.warn("{s} is in use and could not be set aside ({t}); the install will fail until it quits", .{ self.path, rename_err });
+                    return;
+                };
+                std.log.info("{s} is running: set aside as {s}", .{ self.path, std.fs.path.basename(aside) });
+                return;
+            },
+        };
+        file.close(io);
+    }
+};

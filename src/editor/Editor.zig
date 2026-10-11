@@ -69,6 +69,7 @@ const OutputPanel = @import("OutputPanel.zig");
 const SettingsPluginsZon = @import("app").settings.PluginsZon;
 const file_glyphs = @import("file_glyphs.zig");
 const SettingsWatcher = @import("app").watch.SettingsWatcher;
+const ExecutableWatcher = @import("app").watch.ExecutableWatcher;
 const Constants = @import("Constants.zig");
 const DocumentWatcher = @import("DocumentWatcher.zig");
 const DocumentIo = @import("DocumentIo.zig");
@@ -78,6 +79,7 @@ const FolderWatcher = Watch.FolderWatcher;
 
 pub const Workspace = workbench_mod.Workspace;
 pub const KeptDocuments = @import("KeptDocuments.zig");
+pub const Checkpoint = @import("Checkpoint.zig");
 pub const Explorer = @import("explorer/Explorer.zig");
 pub const IgnoreRules = @import("explorer/IgnoreRules.zig");
 pub const Sidebar = @import("Sidebar.zig");
@@ -133,6 +135,10 @@ session: ?KeptDocuments = null,
 /// Frames the session has been read for: its documents open in the first, its panes' selections
 /// apply in the next.
 session_frames: u8 = 0,
+/// Unsaved work kept against a crash (`Checkpoint`).
+checkpoint: Checkpoint = .{},
+/// The executable watcher could not start: not tried again every frame (`syncExecutableWatcher`).
+executable_watch_failed: bool = false,
 /// The `plugins` service, registered at this address in `postInit`.
 plugins_service: sdk.services.plugins.Api = undefined,
 
@@ -375,6 +381,7 @@ pub fn init(
         }
     }
     const palette_folder = try std.fs.path.join(app.allocator, &.{ config_folder, "palettes" });
+    @import("app").crash.writeTo(dvui.io, config_folder);
 
     var editor: Editor = .{
         .app = .{
@@ -418,6 +425,12 @@ pub fn init(
             defer app.allocator.free(dir);
             editor.session = KeptDocuments.loadSession(editor.app.gpa, dir);
         } else |_| {}
+        // The last run ended without quitting (a crash, a kill): what it had unsaved comes back
+        // the way a restart's documents do. A restart's session is newer, and wins.
+        if (Checkpoint.recover(editor.app.gpa, editor.app.config_folder, editor.session != null)) |kept| {
+            editor.session = kept;
+            KeptDocuments.noteRecoveredFromCheckpoint();
+        }
     }
 
     // Save-queue worker is owned by the pixel-art plugin (`initPlugin` in `postInit`).
@@ -1509,6 +1522,7 @@ const WebPluginRequest = struct {
         }
         const lib = arrival.lib orelse {
             dvui.log.err("web plugin '{s}' ({s}): the page could not load it", .{ req.id, req.url });
+            req.failed("the page could not fetch or link the plugin's module (offline, a changed download, or not a plugin)", null);
             gpa.free(req.url);
             return;
         };
@@ -1517,6 +1531,7 @@ const WebPluginRequest = struct {
         // replacing is still running and still owns its documents.
         const ready = PluginLoader.prepare(req.url, req.id, lib) catch |err| {
             dvui.log.err("web plugin '{s}' ({s}): refused: {s}", .{ req.id, req.url, @errorName(err) });
+            req.failed(App.pluginLoadFailureReason(err), lib);
             gpa.free(req.url);
             return;
         };
@@ -1539,6 +1554,7 @@ const WebPluginRequest = struct {
             .arg_c = null,
         }) catch |err| {
             dvui.log.err("web plugin '{s}' ({s}): register failed: {s}", .{ req.id, req.url, @errorName(err) });
+            req.failed(App.pluginLoadFailureReason(err), lib);
             gpa.free(req.url);
             return;
         };
@@ -1547,6 +1563,8 @@ const WebPluginRequest = struct {
             return;
         };
         registered = true;
+        // As `loadUserPluginById` does: a build that loads retires any failure an earlier one left.
+        editor.app.clearFailedUserPlugin(req.id);
         App.syncLoadedPluginDvuiContexts(&editor.app);
         App.syncLoadedPluginRenderBridge(&editor.app);
         for (editor.app.host.plugins.items) |p| {
@@ -1566,6 +1584,23 @@ const WebPluginRequest = struct {
         PluginStore.webLoadSucceeded(req.id);
         dvui.log.info("web plugin '{s}' loaded from {s}", .{ req.id, req.url });
         editor.app.host.refresh();
+    }
+
+    /// This build did not take. With no build of this id running (a remembered build coming
+    /// back, a first install, a repair), the store's Installed pane shows it as failed and says
+    /// why, as the desktop does for a build on disk (`App.recordLoadFailure`) — before, the web
+    /// said so only in the console. An update the running build stays in front of is only noted,
+    /// as a failed reload is on the desktop; its row in the update window turns to Retry
+    /// (`PluginStore.webLoadFailed`).
+    fn failed(req: *const WebPluginRequest, reason: []const u8, lib: ?PluginLoader.WebDynLib) void {
+        const app = &req.editor.app;
+        if (app.host.pluginById(req.id) != null) return app.noteLoadFailed(req.id, reason);
+        const info: ?PluginLoader.PluginVersionInfo = if (lib) |l| PluginLoader.versionInfo(l) else null;
+        const detail: ?[]const u8 = if (info) |i| App.formatPluginProbeDetail(app.gpa, i) catch null else null;
+        defer if (detail) |d| app.gpa.free(d);
+        // `recordPluginFailure` appends: one card per id however many times it is retried.
+        app.clearFailedUserPlugin(req.id);
+        app.recordPluginFailure(req.id, reason, detail, if (info) |i| i.plugin_version else null, .{});
     }
 };
 
@@ -1811,6 +1846,7 @@ pub fn unloadPlugin(editor: *Editor, id: []const u8, opts: UnloadOptions) Unload
 
     // Unmap the image and free our bookkeeping for it.
     var loaded = editor.app.loaded_plugin_libs.orderedRemove(lib_index);
+    @import("app").crash.removeModule(@intFromPtr(loaded.set_globals));
     loaded.lib.close();
     editor.app.gpa.free(loaded.plugin_id);
     editor.app.gpa.free(loaded.path);
@@ -1929,9 +1965,11 @@ pub fn uninstallPlugin(editor: *Editor, id: []const u8, force: bool) !void {
             error.NotUnloadable => {}, // already gone
             else => return err,
         };
-        // As on the desktop: a reinstall asks again (see `clearPluginOwnershipRecord`).
+        // As on the desktop: a reinstall asks again (see `clearPluginOwnershipRecord`), and a
+        // refused build's card goes with it.
         editor.app.untrackDisabledPlugin(id);
         editor.clearPluginOwnershipRecord(id);
+        editor.app.clearFailedUserPlugin(id);
         editor.rebuildExtensionOwnerCache();
         return;
     }
@@ -2175,6 +2213,15 @@ pub fn postInit(editor: *Editor) !void {
         // window that is; this is the app answering once.
         Watch.wake.setHook(wakeEventLoop);
 
+        // What a Windows build set aside to install over this executable while it ran.
+        if (comptime builtin.os.tag == .windows) {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.process.executablePath(dvui.io, &buf)) |n| ExecutableWatcher.removeSetAside(buf[0..n]) else |_| {}
+        }
+
+        // A restart into this executable hands the window over (`driveHandover`).
+        restart.hands_over = true;
+
         editor.app.settings_watcher = SettingsWatcher.init(editor.app.gpa, editor.app.config_folder) catch |err| blk: {
             dvui.log.warn("settings watcher: failed to init ({s}); external hand-edits / dropped-in plugins won't be picked up live", .{@errorName(err)});
             break :blk null;
@@ -2298,6 +2345,7 @@ const fizzy_api_vtable: sdk.EditorAPI.VTable = .{
     .resumeSaveAllQuit = fizzyResumeSaveAllQuit,
     .abortSaveAllQuit = fizzyAbortSaveAllQuit,
     .logLine = fizzyLogLine,
+    .panic = fizzyPanic,
     .drawMenuItem = fizzyDrawMenuItem,
     .askCommandArguments = fizzyAskCommandArguments,
     .loadPluginSettingsFile = fizzyLoadPluginSettingsFile,
@@ -2312,7 +2360,15 @@ fn fizzyAskCommandArguments(ctx: *anyopaque, command_id: []const u8) bool {
 
 fn fizzyLogLine(ctx: *anyopaque, level: std.log.Level, scope: []const u8, message: []const u8) void {
     _ = ctx;
+    // A plugin's dvui refresh record, counted as a frame cause while the profiler records.
+    if (fizzy.core.profile.interceptPluginLine(level, message)) return;
     fizzy.OutputLog.appendLine(level, scope, message);
+}
+
+/// A plugin's panic, raised again as the app's own: the root's handler writes the crash report
+/// (`app.crash`), or on the web logs it to the console.
+fn fizzyPanic(_: *anyopaque, msg: []const u8, first_trace_addr: ?usize) noreturn {
+    std.debug.panicExtra(first_trace_addr, "{s}", .{msg});
 }
 
 /// See `EditorAPI.VTable.drawMenuItem`'s doc comment for why this widget construction has to
@@ -2605,6 +2661,10 @@ fn wakeEventLoop() void {
 
 fn fizzyRefresh(ctx: *anyopaque) void {
     _ = ctx;
+    // A plugin asking for a frame, which goes past `dvui.refresh` and so past its records: counted
+    // as a frame cause here. Which plugin asked, `Host.refresh` does not say (a source location
+    // through it would move the SDK's boundary).
+    fizzy.core.profile.noteRefresh("Host.refresh (a plugin)", 0, false);
     // Safe from any thread (see `SDLBackend.refresh`'s doc comment) — a single call reliably
     // wakes the blocked event loop and produces exactly one composited frame; see
     // `render_bridge.refresh`'s doc comment for how that was verified.
@@ -3717,6 +3777,8 @@ pub fn restartPending(_: *const Editor) bool {
 
 pub fn tick(editor: *Editor) !dvui.App.Result {
     // (A playing demo has already had its turn: `Entry.frameOnce` runs `Demo.frame` first.)
+    // A restart handing the window to the new instance: before anything reads this frame's input.
+    if (comptime restart.supported) editor.driveHandover();
     // Finger or mouse: how far a tap may drift, here and (through the context sync) in every
     // plugin — see `sdk.dvui_context.syncTouchInput`.
     sdk.dvui_context.syncTouchInput();
@@ -3821,6 +3883,14 @@ pub fn tick(editor: *Editor) !dvui.App.Result {
     // Pick up any external edit to settings.zon (see R11 in plans/PLUGIN_MANIFEST_PLAN.md).
     // Cheap no-op unless the watcher thread actually saw a change.
     if (editor.app.settings_watcher) |*w| w.tick(editor.configWatchSink());
+    // fizzy itself rebuilt: start again as the new build, every document kept.
+    editor.syncExecutableWatcher();
+    // Unsaved work kept against a crash.
+    editor.checkpoint.tick(editor);
+    if (editor.app.executable_watcher) |*w| if (w.tick() and !restart.requested()) {
+        dvui.log.info("restart: this executable was rebuilt; restarting into the new build", .{});
+        restart.request();
+    };
     // A rebuilt plugin opened off the UI thread since the last frame is swapped in now.
     editor.plugin_reloads.frame(editor);
 
@@ -3862,8 +3932,9 @@ pub fn tick(editor: *Editor) !dvui.App.Result {
         if (!want_quit) continue;
 
         // A restart keeps every document, unsaved edits included, and asks nothing; one whose
-        // unsaved changes cannot be kept is asked about as for any quit.
-        if (comptime restart.supported) if (restart.requested() and editor.keepSessionForRestart()) continue;
+        // unsaved changes cannot be kept is asked about as for any quit. Handed over, the new
+        // instance has them already.
+        if (comptime restart.supported) if (restart.handedOver() or (restart.requested() and editor.keepSessionForRestart())) continue;
 
         var dirty_n: usize = 0;
         for (editor.app.open_files.values()) |doc| {
@@ -3951,6 +4022,8 @@ pub fn tick(editor: *Editor) !dvui.App.Result {
                 kept.finishDocuments(editor);
                 editor.session_frames += 1;
                 dvui.refresh(null, @src(), null);
+                if (KeptDocuments.recoveredFromCheckpoint())
+                    dvui.toast(@src(), .{ .message = "fizzy did not quit cleanly last time. Its unsaved changes are back." });
             }
         }
     }
@@ -4829,7 +4902,7 @@ pub fn close(app: *Entry, editor: *Editor) void {
         return;
     }
     // A restart keeps every document instead of asking (`keepSessionForRestart`).
-    if (comptime restart.supported) if (restart.requested() and editor.keepSessionForRestart()) {
+    if (comptime restart.supported) if (restart.handedOver() or (restart.requested() and editor.keepSessionForRestart())) {
         editor.app.pending_app_close = true;
         return;
     };
@@ -5032,6 +5105,85 @@ const Placement = struct {
     preview: bool = false,
     take_slot_of: ?[]const u8 = null,
 };
+
+/// Watch this executable while `restart_on_rebuild` is on, and stop when it goes off. Once a frame;
+/// a no-op unless the setting changed. The watcher has to be at its final address to start
+/// (`ExecutableWatcher.start`), which `editor.app` is.
+fn syncExecutableWatcher(editor: *Editor) void {
+    if (comptime !ExecutableWatcher.have_impl or !restart.supported) return;
+    const want = editor.app.settings.restart_on_rebuild;
+    if (want == (editor.app.executable_watcher != null)) return;
+    if (!want) {
+        if (editor.app.executable_watcher) |*w| w.deinit();
+        editor.app.executable_watcher = null;
+        return;
+    }
+    if (editor.executable_watch_failed) return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = std.process.executablePath(dvui.io, &buf) catch |err| {
+        dvui.log.warn("restart: cannot find this executable ({t}); a rebuild will not restart fizzy", .{err});
+        editor.executable_watch_failed = true;
+        return;
+    };
+    editor.app.executable_watcher = ExecutableWatcher.init(editor.app.gpa, buf[0..exe]) catch |err| {
+        dvui.log.warn("restart: cannot watch this executable ({t}); a rebuild will not restart fizzy", .{err});
+        editor.executable_watch_failed = true;
+        return;
+    };
+    if (editor.app.executable_watcher) |*w| w.start() catch |err| {
+        dvui.log.warn("restart: cannot watch this executable ({t}); a rebuild will not restart fizzy", .{err});
+        w.deinit();
+        editor.app.executable_watcher = null;
+        editor.executable_watch_failed = true;
+    };
+}
+
+/// A restart into this executable hands the window over rather than closing it (`restart`): the
+/// session, the layout and the window's place saved, then the new instance started beside this
+/// one. Until it is ready this one stays on screen and takes no input, so nothing done after the
+/// save is lost; then its quit is posted. Should anything fail, the restart goes the ordinary way.
+fn driveHandover(editor: *Editor) void {
+    // The new instance's side: the lock, once the old instance has let go of it.
+    if (restart.startedByHandover()) {
+        if (restart.pollReleased(dvui.io, editor.app.gpa)) {
+            @import("app").single_instance.acquireLock(editor.app.gpa, &.{}) catch |err| dvui.log.warn("restart: could not take the single-instance lock: {t}", .{err});
+            fizzy.core.profile.phase(dvui.io, "handover lock");
+        }
+        return;
+    }
+    if (restart.canHandOver()) {
+        const gpa = editor.app.gpa;
+        if (!editor.keepSessionForRestart()) {
+            // A document the session cannot keep: the ordinary quit asks about it.
+            restart.declineHandover();
+            return;
+        }
+        editor.saveRegions();
+        fizzy.backend.saveWindowGeometry(fizzy.entry().window);
+        const dir = std.fs.path.join(gpa, &.{ editor.app.config_folder, "handover" }) catch return restart.declineHandover();
+        defer gpa.free(dir);
+        restart.beginHandover(dvui.io, gpa, dir) catch |err| {
+            dvui.log.warn("restart: could not start the new instance beside this one ({t}); restarting the ordinary way", .{err});
+            return;
+        };
+        dvui.log.info("restart: handing the window over to the new instance", .{});
+    }
+    switch (restart.pollHandover(dvui.io)) {
+        .none, .ready => {},
+        .waiting => {
+            // The session is saved: anything typed now would be lost.
+            for (dvui.events()) |*e| e.handled = true;
+        },
+        .failed => {
+            dvui.log.err("restart: the new instance did not come up; carrying on in this one", .{});
+            if (KeptDocuments.sessionDir(editor.app.gpa, editor.app.config_folder)) |dir| {
+                defer editor.app.gpa.free(dir);
+                std.Io.Dir.cwd().deleteTree(dvui.io, dir) catch {};
+            } else |_| {}
+            dvui.toast(@src(), .{ .message = "The new build did not start. Still running this one." });
+        },
+    }
+}
 
 /// Write every open document to the session a restart reopens (`KeptDocuments`). False when one
 /// has unsaved changes its owner cannot keep, or the session could not be written: then the quit
@@ -5882,6 +6034,10 @@ pub fn deinit(editor: *Editor) !void {
         w.stop();
         editor.app.settings_watcher = null;
     }
+    if (editor.app.executable_watcher) |*w| w.deinit();
+    editor.app.executable_watcher = null;
+    // A clean quit: nothing to recover at the next launch.
+    editor.checkpoint.deinit(editor);
     // Rebuilds still opening: their threads joined, what they opened dropped unregistered.
     editor.plugin_reloads.deinit(editor.app.gpa);
     if (editor.session) |*kept| kept.deinit();

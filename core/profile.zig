@@ -24,6 +24,12 @@
 const std = @import("std");
 const dvui = @import("dvui");
 const perf = @import("gfx/perf.zig");
+/// What the profiler keeps past its half-second window: 30 seconds of windows, and the frames
+/// over budget (`lookback`).
+pub const Lookback = @import("profile/Lookback.zig");
+/// Why each frame happened: its events, the `dvui.refresh` calls before it by place, or something
+/// else (a timer, an animation), kept while the profiler records (`frameCauses`).
+pub const FrameCauses = @import("profile/FrameCauses.zig");
 
 /// Bumped whenever `Profiler`'s layout changes. Part of the key the host publishes it under
 /// (`publish_key`), so a plugin built against another layout finds none and records nothing: the
@@ -158,6 +164,7 @@ pub const Profiler = struct {
         self.history_submit = @splat(0);
         for (&self.history_ns) |*h| h.* = @splat(0);
         for (&self.history_calls) |*h| h.* = @splat(0);
+        if (host_lookback) |lb| lb.reset();
     }
 
     /// The frame `ago` frames back (0 the latest recorded): its work, its submit (0 until the
@@ -280,6 +287,7 @@ pub const Profiler = struct {
             }
             self.history_head = (slot + 1) % history_len;
             self.history_filled = @min(self.history_filled + 1, history_len);
+            if (host_lookback) |lb| lb.noteFrame(t, work, self.history_ns[slot][0..self.count], self.history_calls[slot][0..self.count]);
         }
         self.win_work_ns += work;
         self.win_worst_work_ns = @max(self.win_worst_work_ns, work);
@@ -308,6 +316,12 @@ pub const Profiler = struct {
             .frames = self.win_frames,
             .inputs_per_s = @as(f64, @floatFromInt(self.win_inputs)) / (span / std.time.ns_per_s),
         };
+        if (host_lookback) |lb| lb.foldWindow(.{
+            .end_ns = t,
+            .frames = self.win_frames,
+            .work_ns = self.win_work_ns,
+            .worst_work_ns = self.win_worst_work_ns,
+        }, self.slice());
         for (self.slice()) |*e| {
             e.avg_ns = @as(f64, @floatFromInt(e.win_ns)) / frames;
             e.avg_self_ns = @as(f64, @floatFromInt(e.win_ns -| e.win_child_ns)) / frames;
@@ -336,9 +350,46 @@ fn now() i128 {
 /// The host's profiler. Only the host image's copy is ever used as one (`hostFrameBegin`).
 var host_profiler: Profiler = .{};
 var is_host = false;
+/// The host's lookback, made the first frame the profiler records: nothing is spent on it while
+/// nobody profiles. Published beside the profiler under a key of its own, so the profiler's
+/// layout, and the plugins built against it, are untouched.
+var host_lookback: ?*Lookback = null;
+/// The host's frame causes, made like `host_lookback`, and started over each time the profiler
+/// starts recording, so they say what happened while someone looked.
+var host_causes: ?*FrameCauses = null;
+var was_active = false;
 
 const publish_id: dvui.Id = @enumFromInt(0x6669_7a7a_7970_7266); // "fizzyprf"
 const publish_key = std.fmt.comptimePrint("_profiler{d}", .{abi});
+const lookback_key = std.fmt.comptimePrint("_profiler_lookback{d}", .{Lookback.abi});
+const causes_key = std.fmt.comptimePrint("_profiler_causes{d}", .{FrameCauses.abi});
+const phases_key = std.fmt.comptimePrint("_profiler_phases{d}", .{Phases.abi});
+
+/// The moments the app's start took, stamped by the app as it reaches them (`phase`): process
+/// entry, the window, the plugins, the window shown, the first frame; and, for an instance a
+/// restart started beside the old one, the handover's. Measured by the app itself, on every
+/// platform, rather than from outside. Published beside the profiler under its own key.
+pub const Phases = struct {
+    pub const abi: u32 = 1;
+    pub const max = 16;
+    /// Each phase's name: a string that lives as long as the process (a literal).
+    names: [max][]const u8 = undefined,
+    at_ns: [max]i128 = undefined,
+    len: usize = 0,
+
+    /// Milliseconds from the first phase to phase `i`.
+    pub fn ms(self: *const Phases, i: usize) f64 {
+        return @as(f64, @floatFromInt(self.at_ns[i] - self.at_ns[0])) / std.time.ns_per_ms;
+    }
+
+    /// As ZON: each phase and when it came, in milliseconds from the first.
+    pub fn write(self: *const Phases, w: *std.Io.Writer, indent: []const u8) std.Io.Writer.Error!void {
+        try w.writeAll(".{\n");
+        for (0..self.len) |i| try w.print("{s}    .{{ .phase = \"{s}\", .ms = {d:.1} }},\n", .{ indent, self.names[i], self.ms(i) });
+        try w.print("{s}}}", .{indent});
+    }
+};
+var host_phases: Phases = .{};
 
 /// The profiler to record into: the host's own in the host, the one it published in a plugin.
 /// Null when there is none, or it was built with another layout.
@@ -351,6 +402,100 @@ pub fn current() ?*Profiler {
     const addr = dvui.dataGet(null, publish_id, publish_key, usize) orelse return null;
     const p: *Profiler = @ptrFromInt(addr);
     return if (p.abi == abi) p else null;
+}
+
+/// What the profiler kept past its half-second window, from any image: the costs of the last 30
+/// seconds and the frames over budget. Null until the profiler has recorded a frame.
+pub fn lookback() ?*Lookback {
+    if (is_host) return host_lookback;
+    if (dvui.current_window == null) return null;
+    const addr = dvui.dataGet(null, publish_id, lookback_key, usize) orelse return null;
+    return @ptrFromInt(addr);
+}
+
+/// Why the frames since the profiler started recording happened, from any image. Null until it
+/// has recorded a frame.
+pub fn frameCauses() ?*FrameCauses {
+    if (is_host) return host_causes;
+    if (dvui.current_window == null) return null;
+    const addr = dvui.dataGet(null, publish_id, causes_key, usize) orelse return null;
+    return @ptrFromInt(addr);
+}
+
+/// Whether frame causes are being recorded: the host's profiler is. The app turns dvui's refresh
+/// records on while it is (`dvui.debug.logRefresh`) and hands each to `noteRefresh` (`interceptLog`).
+pub fn recordingCauses() bool {
+    return host_causes != null and host_profiler.active;
+}
+
+/// A `dvui.refresh` from `file`:`line`, from any thread: counted toward the next frame's cause
+/// while the profiler records.
+pub fn noteRefresh(file: []const u8, line: u32, from_thread: bool) void {
+    if (!recordingCauses()) return;
+    host_causes.?.noteRefresh(file, line, from_thread);
+}
+
+/// For the app's `std.Options.logFn`, first thing: dvui's refresh records (`{s}:{d} refresh`,
+/// logged at debug while `dvui.debug.logRefresh` is on) are counted as frame causes. True when the
+/// call was one of dvui's refresh-debugging lines, which the app then drops unless it is also
+/// logging refreshes itself. Matched by format at compile time, so every other log call costs
+/// nothing here; a test holds dvui to the formats (`fizzy-integration-tests`).
+pub fn interceptLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) bool {
+    if (comptime level != .debug or scope != .dvui) return false;
+    if (comptime std.mem.eql(u8, format, "{s}:{d} refresh {?x}")) {
+        noteRefresh(args[0], @intCast(args[1]), false);
+        return true;
+    }
+    if (comptime std.mem.eql(u8, format, "{s}:{d} refreshBackend {?x}")) {
+        noteRefresh(args[0], @intCast(args[1]), true);
+        return true;
+    }
+    // Logged with the refresh records, at every frame's start.
+    return comptime std.mem.eql(u8, format, "Window.begin frame_time_ns {d}");
+}
+
+/// A plugin dylib's log line (`Host.logLine`), from its own dvui: its refresh records reach the
+/// host as text, `<file>:<line> refresh <id>` or `refreshBackend`, and are counted like the host's
+/// (`interceptLog`). True when the line was one, which the host then drops. Read only while
+/// recording; a plugin's release build compiles the records out, so only its Debug builds name
+/// their places.
+pub fn interceptPluginLine(level: std.log.Level, message: []const u8) bool {
+    if (level != .debug or !recordingCauses()) return false;
+    const at = std.mem.indexOf(u8, message, " refresh") orelse return false;
+    const loc = message[0..at];
+    const colon = std.mem.lastIndexOfScalar(u8, loc, ':') orelse return false;
+    const line = std.fmt.parseInt(u32, loc[colon + 1 ..], 10) catch return false;
+    noteRefresh(loc[0..colon], line, std.mem.startsWith(u8, message[at..], " refreshBackend"));
+    return true;
+}
+
+/// The events this frame has to handle, less the one dvui adds to every frame (the pointer's
+/// `position`, so hover follows it): it causes nothing.
+fn causingEvents() usize {
+    var n: usize = 0;
+    for (dvui.events()) |e| {
+        if (e.evt == .mouse and e.evt.mouse.action == .position) continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// Host only: the app's start has reached `name` (a string literal). The first call is time zero.
+/// Past `Phases.max`, not kept. `io` reads the clock: the process's own before the backend has
+/// set `dvui.io` (at the top of `main`), which the clock otherwise goes through.
+pub fn phase(io: std.Io, name: []const u8) void {
+    if (host_phases.len == Phases.max) return;
+    host_phases.names[host_phases.len] = name;
+    host_phases.at_ns[host_phases.len] = std.Io.Clock.boot.now(io).nanoseconds;
+    host_phases.len += 1;
+}
+
+/// The app's start, from any image.
+pub fn phases() ?*const Phases {
+    if (is_host) return &host_phases;
+    if (dvui.current_window == null) return null;
+    const addr = dvui.dataGet(null, publish_id, phases_key, usize) orelse return null;
+    return @ptrFromInt(addr);
 }
 
 /// Host only: the profiler the window shows and controls.
@@ -366,6 +511,17 @@ pub fn hostFrameBegin(prev_submit_ns: ?u64) void {
     is_host = true;
     host_profiler.frameBegin(prev_submit_ns);
     dvui.dataSet(null, publish_id, publish_key, @as(usize, @intFromPtr(&host_profiler)));
+    if (host_lookback == null and host_profiler.active) host_lookback = Lookback.create(std.heap.page_allocator, max_entries) catch null;
+    if (host_lookback) |lb| dvui.dataSet(null, publish_id, lookback_key, @as(usize, @intFromPtr(lb)));
+    dvui.dataSet(null, publish_id, phases_key, @as(usize, @intFromPtr(&host_phases)));
+    const active = host_profiler.active;
+    if (host_causes == null and active) host_causes = std.heap.page_allocator.create(FrameCauses) catch null;
+    if (host_causes) |c| {
+        if (active and !was_active) c.* = .{};
+        if (active) c.frameBegin(causingEvents());
+        dvui.dataSet(null, publish_id, causes_key, @as(usize, @intFromPtr(c)));
+    }
+    was_active = active;
 }
 
 /// Host only, at the end of every frame.
@@ -418,7 +574,30 @@ pub const ReportOptions = struct {
     /// Leave out scopes cheaper than this per frame, on average: most of a frame's scopes cost
     /// next to nothing, and a reader wants the ones that do not.
     min_ms: f64 = 0.01,
+    /// Also the costliest scopes over this many milliseconds (`lookback`, at most 30 s), by
+    /// their own time, when above zero: the averages a half second hides.
+    over_ms: u32 = 0,
+    /// How many scopes `over` lists, and each hitch.
+    top: usize = 10,
+    /// Also the newest this many frames that went over budget (`Lookback.budget_ns`), each with
+    /// its costliest scopes.
+    hitches: usize = 0,
+    /// Also why the frames happened (`FrameCauses`), with at most this many of the places that
+    /// asked for them; 0 leaves it out.
+    causes: usize = 8,
+    /// Also the app's start (`Phases`): when it reached each phase.
+    startup: bool = false,
 };
+
+/// Each entry's own time in a frame whose times (`ns`, indexed as `Profiler.slice`) are given:
+/// its time less its children's.
+pub fn selfTimes(p: *const Profiler, ns: []const u32, out: []u64) void {
+    const n = @min(ns.len, out.len, p.count);
+    for (out[0..n], ns[0..n]) |*o, v| o.* = v;
+    for (p.entries[0..n], 0..) |e, i| if (e.parent != none and e.parent < n) {
+        out[e.parent] -|= ns[i];
+    };
+}
 
 /// What the last window (`window_ns`) measured, as ZON, a line per item so two reports diff:
 /// the frame (rate, interval, fizzy's work, its worst, the backend's submit), each owner's own
@@ -465,7 +644,80 @@ pub fn report(p: *const Profiler, w: *std.Io.Writer, opts: ReportOptions) std.Io
     for (p.entries[0..p.count], 0..) |e, i| {
         if (e.parent == none) try writeScope(p, w, @intCast(i), none, &out_index, &written, opts);
     }
-    try w.writeAll("    },\n}\n");
+    try w.writeAll("    },\n");
+    if (lookback()) |lb| {
+        if (opts.over_ms > 0) try writeOver(p, lb, w, opts);
+        if (opts.hitches > 0) try writeHitches(p, lb, w, opts);
+    }
+    if (opts.startup) if (phases()) |ph| {
+        try w.writeAll("    .startup = ");
+        try ph.write(w, "    ");
+        try w.writeAll(",\n");
+    };
+    if (opts.causes > 0) if (frameCauses()) |c| {
+        try w.writeAll("    .causes = ");
+        try c.write(w, "    ", opts.causes);
+        try w.writeAll(",\n");
+    };
+    try w.writeAll("}\n");
+}
+
+/// The costliest scopes over `opts.over_ms`, by their own time per frame.
+fn writeOver(p: *const Profiler, lb: *const Lookback, w: *std.Io.Writer, opts: ReportOptions) std.Io.Writer.Error!void {
+    var costs: [max_entries]Lookback.Cost = undefined;
+    const n = p.count;
+    const span = lb.costs(opts.over_ms, costs[0..n]);
+    var order: [max_entries]u16 = undefined;
+    for (order[0..n], 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u16, order[0..n], costs[0..n], struct {
+        fn lt(cs: []const Lookback.Cost, a: u16, b: u16) bool {
+            return cs[a].self_ns > cs[b].self_ns;
+        }
+    }.lt);
+    try w.print("    .over = .{{ .seconds = {d:.1}, .frames = {d}, .work_ms = {d:.3}, .worst_work_ms = {d:.3}, .top = .{{\n", .{
+        @as(f64, @floatFromInt(span.ns)) / std.time.ns_per_s, span.frames, millis(span.work_ns), millis(@floatFromInt(span.worst_work_ns)),
+    });
+    for (order[0..@min(n, opts.top)]) |i| {
+        const c = costs[i];
+        if (millis(c.self_ns) < opts.min_ms) break;
+        const e = p.entries[i];
+        try w.print("        .{{ .owner = \"{f}\", .name = \"{f}\", .self_ms = {d:.3}, .avg_ms = {d:.3}, .max_ms = {d:.3}, .calls = {d:.1} }},\n", .{
+            std.zig.fmtString(e.owner), std.zig.fmtString(e.name), millis(c.self_ns), millis(c.avg_ns), millis(@floatFromInt(c.max_ns)), c.calls,
+        });
+    }
+    try w.writeAll("    } },\n");
+}
+
+/// The newest `opts.hitches` frames over budget, each with its costliest scopes by own time.
+fn writeHitches(p: *const Profiler, lb: *const Lookback, w: *std.Io.Writer, opts: ReportOptions) std.Io.Writer.Error!void {
+    try w.print("    .hitch_budget_ms = {d:.3},\n    .hitches = .{{\n", .{millis(@floatFromInt(lb.budget_ns))});
+    const t = now();
+    var ago: usize = 0;
+    while (ago < opts.hitches) : (ago += 1) {
+        const h = lb.hitchAt(ago) orelse break;
+        var self_ns: [max_entries]u64 = undefined;
+        const n = h.ns.len;
+        selfTimes(p, h.ns, self_ns[0..n]);
+        var order: [max_entries]u16 = undefined;
+        for (order[0..n], 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sort(u16, order[0..n], self_ns[0..n], struct {
+            fn lt(ss: []const u64, a: u16, b: u16) bool {
+                return ss[a] > ss[b];
+            }
+        }.lt);
+        try w.print("        .{{ .ago_s = {d:.1}, .work_ms = {d:.3}, .top = .{{\n", .{
+            @as(f64, @floatFromInt(t - h.at_ns)) / std.time.ns_per_s, millis(@floatFromInt(h.work_ns)),
+        });
+        for (order[0..@min(n, opts.top)]) |i| {
+            if (millis(@floatFromInt(self_ns[i])) < opts.min_ms) break;
+            const e = p.entries[i];
+            try w.print("            .{{ .owner = \"{f}\", .name = \"{f}\", .self_ms = {d:.3}, .ms = {d:.3}, .calls = {d} }},\n", .{
+                std.zig.fmtString(e.owner), std.zig.fmtString(e.name), millis(@floatFromInt(self_ns[i])), millis(@floatFromInt(h.ns[i])), h.calls[i],
+            });
+        }
+        try w.writeAll("        } },\n");
+    }
+    try w.writeAll("    },\n");
 }
 
 fn writeScope(p: *const Profiler, w: *std.Io.Writer, idx: u16, parent_out: u16, out_index: *[max_entries]u16, written: *u16, opts: ReportOptions) std.Io.Writer.Error!void {

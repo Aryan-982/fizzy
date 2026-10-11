@@ -21,10 +21,17 @@ const profile = core.profile;
 const viz = core.viz;
 
 pub var open: bool = false;
-var rect: dvui.Rect = .{ .x = 80, .y = 80, .w = 720, .h = 560 };
+var rect: dvui.Rect = .{ .x = 80, .y = 80, .w = 1000, .h = 640 };
 var view: enum { by_plugin, tree } = .by_plugin;
+/// What the table and the pie cover: the last half second, or the last 30 s (`profile.lookback`).
+var span: enum { recent, long } = .recent;
+/// The hitch the person clicked, held in the table and the pie until clicked again; by when it
+/// happened, since newer hitches move it along the list.
+var held_hitch: ?i128 = null;
 /// The window is too narrow for the table's full share bars (a phone).
 var narrow = false;
+/// Wide enough for the pie beside the table; narrower, it sits above it.
+var beside = true;
 /// Ask for every frame while the window is open, instead of only the ones something wants.
 var continuous = false;
 
@@ -58,6 +65,7 @@ pub fn draw() void {
     rect.x = std.math.clamp(rect.x, margin, @max(margin, screen.w - rect.w - margin));
     rect.y = std.math.clamp(rect.y, margin, @max(margin, screen.h - rect.h - margin));
     narrow = rect.w < 600;
+    beside = rect.w >= 860;
 
     // Frosted like every floating surface — and its blur shows up in its own numbers, under
     // "frost pane", with every other surface's.
@@ -114,8 +122,15 @@ pub fn draw() void {
         if (dvui.button(@src(), if (view == .by_plugin) "Call tree" else "By plugin", .{}, .{})) {
             view = if (view == .by_plugin) .tree else .by_plugin;
         }
+        if (dvui.button(@src(), if (span == .recent) "Last 30 s" else "Last 0.5 s", .{}, .{})) {
+            span = if (span == .recent) .long else .recent;
+        }
         // The explanation is the widest thing in the window; a phone has no room for it.
-        if (!narrow) dvui.labelNoFmt(@src(), "per frame, over the last 0.5 s — self is a scope's time less the scopes inside it", .{}, .{
+        const explain = if (span == .recent)
+            "per frame, over the last 0.5 s — self is a scope's time less the scopes inside it"
+        else
+            "per frame, over the last 30 s; max is the slowest frame in it";
+        if (!narrow) dvui.labelNoFmt(@src(), explain, .{}, .{
             .gravity_y = 0.5,
             .color_text = .{ .color = dim },
         });
@@ -127,30 +142,113 @@ pub fn draw() void {
     const inspected = drawGraph(p, mono, dim);
     p.frozen = inspected != null;
 
+    // The frames that went over budget, as chips: one clicked is held in the table and the pie.
+    const held = drawHitches();
+
+    // What the table and the pie show: the frame under the pointer, a held hitch, the last 30 s,
+    // or the last half second, in the shape they read (an entry's numbers as its "average").
     var entries = p.slice();
     var work = @max(s.work_ns, 1);
-    if (inspected) |ago| if (p.historyFrame(ago)) |f| {
-        // That frame's numbers, in the shape the tables read: its time as the "average", its
-        // self time from its children's, its calls.
-        const copy = arena.dupe(profile.Entry, entries) catch entries;
-        for (copy, 0..) |*e, i| {
-            e.avg_ns = @floatFromInt(f.ns[i]);
-            e.avg_calls = @floatFromInt(f.calls[i]);
-            e.max_ns = f.ns[i];
-            e.avg_self_ns = e.avg_ns;
+    var caption_buf: [48]u8 = undefined;
+    var caption: []const u8 = "per frame";
+    if (inspected) |ago| {
+        if (p.historyFrame(ago)) |f| {
+            entries = withFrame(arena, entries, f.ns, f.calls);
+            work = @max(@as(f64, @floatFromInt(f.work_ns)), 1);
+            caption = std.fmt.bufPrint(&caption_buf, "frame -{d}", .{ago}) catch "";
         }
-        for (copy) |e| if (e.parent != std.math.maxInt(u16)) {
-            copy[e.parent].avg_self_ns = @max(0, copy[e.parent].avg_self_ns - e.avg_ns);
-        };
-        entries = copy;
-        work = @max(@as(f64, @floatFromInt(f.work_ns)), 1);
-    };
+    } else if (held) |h| {
+        entries = withFrame(arena, entries, h.ns, h.calls);
+        work = @max(@as(f64, @floatFromInt(h.work_ns)), 1);
+        caption = std.fmt.bufPrint(&caption_buf, "hitch {d:.1} s ago", .{secondsAgo(h.at_ns)}) catch "";
+    } else if (span == .long) {
+        if (profile.lookback()) |lb| {
+            if (arena.alloc(profile.Lookback.Cost, entries.len)) |costs| {
+                const covered = lb.costs(30_000, costs);
+                const copy = arena.dupe(profile.Entry, entries) catch entries;
+                for (copy, costs) |*e, c| {
+                    e.avg_ns = c.avg_ns;
+                    e.avg_self_ns = c.self_ns;
+                    e.avg_calls = c.calls;
+                    e.max_ns = c.max_ns;
+                }
+                entries = copy;
+                work = @max(covered.work_ns, 1);
+                caption = std.fmt.bufPrint(&caption_buf, "per frame · {d:.0} s", .{@as(f64, @floatFromInt(covered.ns)) / std.time.ns_per_s}) catch "";
+            } else |_| {}
+        }
+    }
     var rows: std.ArrayList(Row) = .empty;
     switch (view) {
         .by_plugin => collectByPlugin(arena, entries, work, &rows),
         .tree => collectTree(arena, entries, &rows),
     }
-    drawGrid(rows.items, work);
+    // Where the frame went: its costliest scopes as a pie beside the table, the same frame the
+    // table shows (the averages, or the one held under the pointer).
+    var lower = dvui.box(@src(), .{ .dir = if (beside) .horizontal else .vertical }, .{ .expand = .both });
+    defer lower.deinit();
+    {
+        var pie: viz.Pie = .init(@src(), collectSlices(arena, entries, work), .{ .unit = "ms", .caption = caption }, .{
+            .min_size_content = .{ .w = if (beside) 420 else 300, .h = if (beside) 260 else 200 },
+            .expand = if (beside) .none else .horizontal,
+            .margin = .{ .w = if (beside) 8 else 0, .h = if (beside) 0 else 8 },
+        });
+        pie.deinit();
+        drawGrid(rows.items, work, .{ .keys = pie.keys, .colors = pie.colors, .hovered = if (pie.hovered) |h| pie.keys[h] else null });
+    }
+}
+
+/// `entries` as one frame saw them (`ns`, `calls`, indexed as `entries`): its time as each one's
+/// "average", its self time from its children's, its calls.
+fn withFrame(arena: std.mem.Allocator, entries: []profile.Entry, ns: []const u32, calls: []const u16) []profile.Entry {
+    const copy = arena.dupe(profile.Entry, entries) catch return entries;
+    for (copy, 0..) |*e, i| {
+        const t: u32 = if (i < ns.len) ns[i] else 0;
+        e.avg_ns = @floatFromInt(t);
+        e.avg_calls = if (i < calls.len) @floatFromInt(calls[i]) else 0;
+        e.max_ns = t;
+        e.avg_self_ns = e.avg_ns;
+    }
+    for (copy) |e| if (e.parent != std.math.maxInt(u16)) {
+        copy[e.parent].avg_self_ns = @max(0, copy[e.parent].avg_self_ns - e.avg_ns);
+    };
+    return copy;
+}
+
+fn secondsAgo(at_ns: i128) f64 {
+    return @as(f64, @floatFromInt(core.perf.nanoTimestamp() - at_ns)) / std.time.ns_per_s;
+}
+
+const Held = struct { at_ns: i128, work_ns: u64, ns: []const u32, calls: []const u16 };
+
+/// The kept hitches as a row of chips, newest first, each saying when and how long; a click holds
+/// one (and another click lets it go). The held one, while it is still kept.
+fn drawHitches() ?Held {
+    const lb = profile.lookback() orelse return null;
+    if (lb.hitch_filled == 0) {
+        held_hitch = null;
+        return null;
+    }
+    var row = dvui.flexbox(@src(), .{ .justify_content = .start }, .{ .expand = .horizontal, .margin = .{ .h = 6 } });
+    defer row.deinit();
+    const dim = dvui.themeGet().color(.control, .text).opacity(0.6);
+    var buf: [64]u8 = undefined;
+    const title = std.fmt.bufPrint(&buf, "over {d:.1} ms:", .{@as(f64, @floatFromInt(lb.budget_ns)) / std.time.ns_per_ms}) catch "";
+    dvui.labelNoFmt(@src(), title, .{}, .{ .color_text = .{ .color = dim }, .gravity_y = 0.5 });
+    var found: ?Held = null;
+    var clicked: ??i128 = null;
+    var ago: usize = 0;
+    while (lb.hitchAt(ago)) |h| : (ago += 1) {
+        const is_held = held_hitch != null and held_hitch.? == h.at_ns;
+        if (is_held) found = .{ .at_ns = h.at_ns, .work_ns = h.work_ns, .ns = h.ns, .calls = h.calls };
+        const text = std.fmt.bufPrint(&buf, "{d:.0} s ago · {d:.1} ms", .{ secondsAgo(h.at_ns), @as(f64, @floatFromInt(h.work_ns)) / std.time.ns_per_ms }) catch "";
+        if (dvui.button(@src(), text, .{}, .{ .id_extra = ago, .style = if (is_held) .highlight else .control, .margin = .all(2) })) {
+            clicked = if (is_held) @as(?i128, null) else h.at_ns;
+        }
+    }
+    // A click takes effect next frame; one held that fell out of the list is let go.
+    if (clicked) |c| held_hitch = c else if (found == null) held_hitch = null;
+    return found;
 }
 
 /// The last `profile.history_len` frames' work as columns, newest at the right, each with its
@@ -200,6 +298,8 @@ fn ms(ns: f64) f64 {
 /// One line of the table.
 const Row = struct {
     name: []const u8,
+    /// The scope's key, so its bar is the colour of its slice in the pie; none for an owner.
+    key: ?u64 = null,
     indent: u8 = 0,
     strong: bool = false,
     self_ns: f64 = 0,
@@ -208,7 +308,21 @@ const Row = struct {
     max_ns: f64 = 0,
 };
 
-fn drawGrid(rows: []const Row, work: f64) void {
+/// The pie's colours, for the table's bars to match, and the slice under the pointer, whose row
+/// stays bright while the others fade.
+const PieColors = struct {
+    keys: []const u64 = &.{},
+    colors: []const dvui.Color = &.{},
+    hovered: ?u64 = null,
+
+    fn of(self: PieColors, key: ?u64) ?dvui.Color {
+        const k = key orelse return null;
+        for (self.keys, self.colors) |pk, c| if (pk == k) return c;
+        return null;
+    }
+};
+
+fn drawGrid(rows: []const Row, work: f64, pie: PieColors) void {
     const columns = [_]viz.Table.Column{
         .{ .title = "", .kind = .text },
         .{ .title = "self ms" },
@@ -225,8 +339,45 @@ fn drawGrid(rows: []const Row, work: f64) void {
         table.number(i, 2, ms(r.total_ns));
         table.number(i, 3, if (r.strong) null else r.calls);
         table.number(i, 4, ms(r.max_ns));
-        table.bar(i, 5, viz.scale.fraction(r.self_ns, work), .{ .strong = r.strong });
+        var bar_col = pie.of(r.key);
+        if (pie.hovered) |h| if (r.key != h) {
+            bar_col = (bar_col orelse dvui.themeGet().color(.highlight, .fill)).opacity(0.3);
+        };
+        table.bar(i, 5, viz.scale.fraction(r.self_ns, work), .{ .strong = r.strong, .color = bar_col });
     }
+}
+
+/// How many scopes the pie names; the rest of the frame's work is one slice, "the rest".
+const pie_slices = 7;
+
+/// The frame's costliest scopes by their own time, each named with its owner, and the rest of
+/// the frame's work as one slice.
+fn collectSlices(arena: std.mem.Allocator, entries: []profile.Entry, work: f64) []const viz.Pie.Slice {
+    var idx: std.ArrayList(usize) = .empty;
+    for (entries, 0..) |e, i| if (e.avg_self_ns > 0) idx.append(arena, i) catch return &.{};
+    std.mem.sort(usize, idx.items, entries, struct {
+        fn lt(es: []profile.Entry, a: usize, b: usize) bool {
+            return es[a].avg_self_ns > es[b].avg_self_ns;
+        }
+    }.lt);
+    var slices: std.ArrayList(viz.Pie.Slice) = .empty;
+    var named: f64 = 0;
+    for (idx.items[0..@min(idx.items.len, pie_slices)]) |i| {
+        const e = entries[i];
+        // Fizzy's own scopes by name; a plugin's with its id in front, unless the name says it.
+        const short = shortName(e.name);
+        const label = if (std.mem.eql(u8, e.owner, "fizzy") or std.mem.startsWith(u8, short, e.owner)) short else std.fmt.allocPrint(arena, "{s} · {s}", .{ e.owner, short }) catch short;
+        slices.append(arena, .{ .label = label, .value = @floatCast(ms(e.avg_self_ns)), .key = e.key }) catch break;
+        named += e.avg_self_ns;
+    }
+    const rest = work - named;
+    if (ms(rest) >= min_ms_shown) slices.append(arena, .{
+        .label = "the rest",
+        .value = @floatCast(ms(rest)),
+        .key = 0,
+        .color = dvui.themeGet().color(.control, .text).opacity(0.35),
+    }) catch {};
+    return slices.items;
 }
 
 /// Rows below this much total time (ms per frame) are left out: they are noise, and a table of
@@ -285,6 +436,7 @@ fn collectByPlugin(arena: std.mem.Allocator, entries: []profile.Entry, work: f64
             const e = entries[i];
             rows.append(arena, .{
                 .name = pathName(arena, entries, i),
+                .key = e.key,
                 .indent = 1,
                 .self_ns = e.avg_self_ns,
                 .total_ns = e.avg_ns,
@@ -343,6 +495,7 @@ fn collectTree(arena: std.mem.Allocator, entries: []profile.Entry, rows: *std.Ar
                 const name = if (outermostForOwner(es, e)) std.fmt.allocPrint(a, "{s} · {s}", .{ e.owner, shortName(e.name) }) catch e.name else shortName(e.name);
                 out.append(a, .{
                     .name = name,
+                    .key = e.key,
                     .indent = e.depth,
                     .strong = e.depth == 0,
                     .self_ns = e.avg_self_ns,

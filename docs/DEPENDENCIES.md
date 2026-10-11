@@ -69,18 +69,31 @@ backend and never link SDL, so an SDL bump is never an SDK release and never mov
 6. **screensSet: floating widgets can be kept on screens besides the window** (`a90bc70`).
    `dvui.screensSet(rects)` lists areas besides the window that are screens of their own;
    floating windows, menus and tooltips place, clip and dim against `dvui.screenFor` (the one
-   holding their middle, else `windowRect`). Not yet used by fizzy, whose `core.screens` and
-   widget forks do the same. Upstream: branch `screens-set`, to propose. Test: "a floating window
-   on another screen (dvui.screensSet) stays on it".
+   holding their middle, else `windowRect`). Popout sets each float window's band as one (#325),
+   and the backend's `os_windows` each `dvui.osWindow`'s. Upstream: branch `screens-set`, to
+   propose. Test: "a floating window on another screen (dvui.screensSet) stays on it".
+7. **OsWindowWidget: a child window is deinit before its backend** (`f0f498a`). `ChildOsWindow.deinit`
+   freed the backend first, then the `dvui.Window`, whose deinit gives its textures (the font
+   atlases) back to that backend: closing any `dvui.osWindow` on a backend with secondary windows
+   crashed. Upstream: worth proposing on its own.
+8. **osWindow: the fallback floating window is the window asked for, and its backend hears of it**
+   (`f646ec0`). Where a backend makes no OS window of its own, `dvui.osWindow` falls back to a
+   floating window, which now takes the window's size, least and most size, `id_extra`, a close
+   button on its `open_flag` (the next frame asked for at once), and steps past one already there;
+   and the backend hears of it each frame (`Backend.osWindowFloating`: its id, the header it is
+   moved by, the options). Fizzy's backend makes no secondary `dvui.Window`, so every
+   `dvui.osWindow` takes this path, and `backend/src/os_windows.zig` shows the floating window in
+   an OS window of its own. Upstream: to propose with `run-dvui` (fizzyedit/example-app) as the
+   demonstration.
 
 Each of 5 and 6 is also a branch of its own on upstream `main` (`window-draw-retained`,
 `screens-set`), from which the upstream PR is opened.
 
 Tags: `fizzy-sdk-0.2.13` → `712f7f7` (the stack before this rebase, still what SDK ≤ 0.2.15
 builds); `fizzy-sdk-0.2.16` → `4428108` (SDK 0.2.16 to 0.2.18); `fizzy-sdk-0.2.19` →
-`f8b32db`; `fizzy-sdk-0.2.19-2` → `a90bc70`, what `sdk/build.zig.zon` pins now (0.2.19 was not
-released yet, and a tag never moves, so the second pin of one version takes a suffix, as the SDL
-fork's tags do).
+`f8b32db`; `fizzy-sdk-0.2.19-2` → `a90bc70` (0.2.19 was not released yet, and a tag never
+moves, so the second pin of one version takes a suffix, as the SDL fork's tags do; SDK 0.2.19 to
+0.2.22); `fizzy-sdk-0.2.23` → `f646ec0`, what `sdk/build.zig.zon` pins now.
 
 Fizzy builds dvui in its `custom` backend mode on every target and links its own backends
 (`backend/`, `src/backend/WebBackend.zig` + `web/web.js`), so dvui's `sdl3` and `web`
@@ -189,6 +202,30 @@ Fizzy adapts to two upstream behaviours rather than patching them:
    always taken. For the standard xkeyboard-config keymaps both paths give the same masks.
    Upstream `main` has the same problem. Upstream: worth proposing; the PR text is in #289.
 
+9. **Cocoa: a live resize AppKit ends without saying so ends all the same** (`f57c7e5`). AppKit
+   can end a live resize without posting `NSWindowDidEndLiveResizeNotification`: on macOS 26 a
+   window dragged to the top of the screen to fill it starts one and never says it ended. 4's
+   timer then ran on, having the Metal view display and the app draw a frame from that display
+   every tick, and the app never got back to its events (a beachball, the user). The timer now
+   asks the window whether it is still in a live resize (`inLiveResize`), and ends it when it is
+   not. Squash into 4 at the next rebase.
+10. **Cocoa: a live resize that has gone still, with no button held, is over** (`629e976`). Tiled
+    to a side of the screen (macOS 26), a window could go on saying it was in a live resize, with
+    no button held and its size settled, and the end never came. A live resize that has gone still
+    with no button held for a second is over (`endLiveResizeIfOver`, from the timer and the
+    display): a drag holds a button, and an animated resize changes the size every tick. Since 11,
+    a last resort. Squash into 4 at the next rebase.
+11. **Cocoa: a live-resize frame that is not a step is drawn after the display, not inside it**
+    (`61e656f`). The root of 9 and 10. Every frame of a live resize was drawn inside a display —
+    the timer's while the pointer rests and the app's while it animates
+    (`fizzy_native_live_resize_next_frame`), not only the steps — so with a frame as long as a
+    refresh the main thread had nothing between frames, and AppKit could not finish a live resize
+    it was animating (a tile): it never posted its end. Only a step, where the size changed, is
+    drawn in its display now; any other frame just after it, outside the transaction. Measured
+    (`scripts/live-resize`, 120 Hz, a 4 s right-edge drag): 0 stretched frames of 428, every step
+    drawn in its display, 13 frames after one. AppKit ends a tile's live resize about 600 ms in,
+    before 10's second. Squash into 4 at the next rebase.
+
 On top of the patches, **the fork's own tests** (#280): `test/testfizzy.c` runs suites on SDL's
 test harness (`test/testautomation_fizzy*.c`), with no library code changed. Each suite checks one
 patch and must fail on the upstream release it is based on, or, for patch 8, on the fork without
@@ -212,8 +249,8 @@ its patch, and goes upstream in that patch's PR.
 
 Tags: `fizzy-3.4.16-1` → `a4b021c`; `fizzy-3.4.16-2` → `3d6e802`; `fizzy-3.4.16-3` → `8455e58`;
 `fizzy-3.4.16-4` → `2d6efde`; `fizzy-3.4.16-5` → `ee721bf`; `fizzy-3.4.16-6` → `4839ede`;
-`fizzy-3.4.16-7` → `36dda37`; `fizzy-3.4.16-8` → `a518aaf`; `fizzy-3.4.16-9` → `011a2dc`, what
-sdl_zig pins now.
+`fizzy-3.4.16-7` → `36dda37`; `fizzy-3.4.16-8` → `a518aaf`; `fizzy-3.4.16-9` → `011a2dc`;
+`fizzy-3.4.16-10` → `f57c7e5`; `fizzy-3.4.16-11` → `61e656f`, what sdl_zig pins now.
 
 ## fizzyedit/sdl_zig
 
@@ -253,12 +290,17 @@ sdl_zig pins now.
     an OpenGL ES renderer, and the suite's jobs stop after 20 minutes, writing progress to stderr
     so a hang shows where it stopped. Then the pin moves to SDL's `fizzy-3.4.16-9` (`5e41c70`);
     squash the pin into 1 at the next rebase.
+11. **Build fizzyedit/SDL `fizzy-3.4.16-10`** (`e8f4ac0`): the pin moves to SDL's live-resize fix
+    (9). Squash into 1 at the next rebase.
+12. **Build fizzyedit/SDL `fizzy-3.4.16-11`** (`d0c70fe`): the pin moves to SDL's 10 and 11.
+    Squash into 1 at the next rebase.
 
 Tags: `fizzy-1.0.3+3.4.16-1` → `60114a1`; `fizzy-1.0.3+3.4.16-2` → `5950760`;
 `fizzy-1.0.3+3.4.16-3` → `48468b7`; `fizzy-1.0.3+3.4.16-4` → `58abe38`;
 `fizzy-1.0.3+3.4.16-5` → `8e88dba`; `fizzy-1.0.3+3.4.16-6` → `0f6a2a8`;
 `fizzy-1.0.3+3.4.16-7` → `264af2a`; `fizzy-1.0.3+3.4.16-8` → `a02dda8`;
-`fizzy-1.0.3+3.4.16-9` → `5e41c70`, the commit fizzy pins now.
+`fizzy-1.0.3+3.4.16-9` → `5e41c70`; `fizzy-1.0.3+3.4.16-10` → `e8f4ac0`;
+`fizzy-1.0.3+3.4.16-11` → `d0c70fe`, the commit fizzy pins now.
 
 ## Bumping
 
@@ -275,6 +317,13 @@ Tags: `fizzy-1.0.3+3.4.16-1` → `60114a1`; `fizzy-1.0.3+3.4.16-2` → `5950760`
    the new SDL commit's archive (`zig fetch <url>` prints the hash), push, tag.
 3. In fizzy's `backend/`: `zig fetch --save=sdl https://github.com/fizzyedit/sdl_zig/archive/<sha>.tar.gz`,
    then build macOS, Linux and Windows.
+
+**What fizzy relies on that SDL does not promise.** `GpuRenderer` compiles a Metal program's
+source on a thread of its own (`Compile`): SDL documents no thread for `SDL_CreateGPUShader`, and
+in the pinned SDL it is safe there because `SDL_CreateGPUShader` reads only the device's fixed
+fields and `METAL_CreateShader` calls `newLibraryWithSource` on the `MTLDevice` (thread-safe) in its
+own autorelease pool. On a bump, check both still hold in `src/gpu/SDL_gpu.c` and
+`src/gpu/metal/SDL_gpu_metal.m`.
 
 **A fizzy-only SDL change:** the same, with only step 1's new change instead of a rebase.
 

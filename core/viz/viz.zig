@@ -7,15 +7,17 @@
 //! - `bar`: a share of a whole, as a bar from the left (a table's "share of work").
 //! - `stat`: a number with its label and unit.
 //! - `Table`: columns of names, fixed-decimal numbers and bars, only the rows in view built.
+//! - `Pie`: shares of a whole as a donut, with leaders out to their labels, easing as they change.
 //!
 //! None allocates beyond the frame's arena, and none keeps state but what dvui keeps for its
 //! widgets. The arithmetic is in `scale` (tested without a window).
 const std = @import("std");
 const dvui = @import("dvui");
-const palette = @import("../palette.zig");
+pub const palette = @import("../palette.zig");
 
 pub const scale = @import("scale.zig");
 pub const Table = @import("Table.zig");
+pub const Pie = @import("Pie.zig");
 
 /// One series of a `line`.
 pub const Series = struct {
@@ -63,6 +65,12 @@ pub const Line = struct {
 pub fn seriesColor(i: usize) dvui.Color {
     if (i == 0) return dvui.themeGet().color(.highlight, .fill);
     return palette.colors[(i - 1) % palette.colors.len];
+}
+
+/// The colour for a thing known by `key` (a hash of its name, a profiler scope's key): the same
+/// thing is the same colour in every graphic that shows it, a pie's slice and a table's bar.
+pub fn keyColor(key: u64) dvui.Color {
+    return palette.colors[@intCast(key % palette.colors.len)];
 }
 
 /// `series` over time in a box of their own. The caller `deinit`s what it returns.
@@ -238,6 +246,16 @@ pub fn stat(src: std.builtin.SourceLocation, label: []const u8, value: f64, opts
     if (label.len > 0) dvui.labelNoFmt(@src(), label, .{}, .{ .font = mono, .color_text = .{ .color = dim }, .padding = .{ .w = 4 }, .gravity_y = 0.5 });
     var buf: [48]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{[v]d:.[p]}", .{ .v = value, .p = opts.decimals }) catch "?";
-    dvui.labelNoFmt(@src(), text, .{}, .{ .font = mono, .padding = .{}, .gravity_y = 0.5 });
+    // As wide as three digits and the decimals whatever the number, so a row of stats keeps
+    // its layout while the numbers change: "79" and "120" take the same room.
+    const digits = "000.000000000";
+    const room = mono.textSize(digits[0 .. 3 + @as(usize, if (opts.decimals > 0) 1 + @min(opts.decimals, 9) else 0)]).w;
+    {
+        // Right-aligned in its own box: in the row itself, a child pulled right is packed at the
+        // row's far end, after the unit.
+        var cell = dvui.box(@src(), .{}, .{ .min_size_content = .{ .w = room, .h = 0 }, .gravity_y = 0.5 });
+        defer cell.deinit();
+        dvui.labelNoFmt(@src(), text, .{}, .{ .font = mono, .padding = .{}, .gravity_x = 1 });
+    }
     if (opts.unit.len > 0) dvui.labelNoFmt(@src(), opts.unit, .{}, .{ .font = mono, .color_text = .{ .color = dim }, .padding = .{ .x = 3 }, .gravity_y = 0.5 });
 }

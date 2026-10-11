@@ -43,6 +43,7 @@ const Layout = @import("layout/Layout.zig");
 const Host = sdk.Host;
 const PluginLoader = @import("root.zig").store.Loader;
 const SettingsWatcher = @import("watch/SettingsWatcher.zig");
+const ExecutableWatcher = @import("watch/ExecutableWatcher.zig");
 const FolderWatcher = @import("watch/FolderWatcher.zig");
 const Keymap = @import("keymap/Keymap.zig");
 pub const Settings = @import("settings/Settings.zig");
@@ -254,6 +255,11 @@ settings_save_deadline_ns: i128 = 0,
 /// reconciliation. Set up in `postInit` (needs `editor` at its final heap address — see
 /// `SettingsWatcher.start`'s doc comment), torn down first in `deinit`.
 settings_watcher: ?SettingsWatcher = null,
+
+/// Watches the app's own executable while `settings.restart_on_rebuild` is on: a rebuild restarts
+/// the app into it, keeping every document. Null while the setting is off, and wherever
+/// `SettingsWatcher` would be.
+executable_watcher: ?ExecutableWatcher = null,
 
 /// Recursive watch on the open root folder, fanned out to plugins as `folderPathsChanged`.
 /// Same final-address constraint as the two above — started in `postInit`, retargeted whenever
@@ -516,15 +522,65 @@ pub fn pluginStatus(app: *App, id: []const u8) sdk.services.plugins.Api.Status {
     };
 }
 
-/// The `plugins` service over this app (`pluginStatus`); register it once `app` is at its final
-/// address.
+/// Every plugin the app has, for the `plugins` service's `list`: the loaded ones in the order
+/// they registered, then those that failed to load.
+pub fn pluginList(app: *App, arena: std.mem.Allocator) error{OutOfMemory}![]sdk.services.plugins.Api.Info {
+    const Api = sdk.services.plugins.Api;
+    var out: std.ArrayList(Api.Info) = .empty;
+    const host = &app.host;
+    for (host.plugins.items) |plugin| {
+        if (plugin.internal) continue;
+        var info: Api.Info = .{
+            .id = plugin.id,
+            .name = plugin.display_name,
+            .link = .bundled,
+            .status = app.pluginStatus(plugin.id),
+        };
+        for (app.loaded_plugin_libs.items) |lib| if (std.mem.eql(u8, lib.plugin_id, plugin.id)) {
+            info.link = .library;
+            info.path = lib.path;
+            info.version = lib.version_info.plugin_version;
+            info.built_with_sdk = lib.version_info.built_with_sdk_version;
+        };
+        const r = &info.registered;
+        r.surfaces = countOwned(host.surfaces.items, plugin);
+        r.commands = countOwned(host.commands.items, plugin);
+        r.services = countOwned(host.services.items, plugin);
+        r.menus = countOwned(host.menus.items, plugin) + countOwned(host.menu_sections.items, plugin) +
+            countOwned(host.native_menu_items.items, plugin) + countOwned(host.rail_items.items, plugin) +
+            countOwned(host.open_actions.items, plugin);
+        for (host.settings_schemas.items) |schema| r.settings += @intFromBool(schema.owner == plugin);
+        r.file_kinds = countOwned(host.file_kinds.items, plugin);
+        r.languages = countOwned(host.language_support.items, plugin);
+        try out.append(arena, info);
+    }
+    for (app.failed_user_plugins.items) |f| {
+        if (host.pluginById(f.id) != null) continue;
+        try out.append(arena, .{ .id = f.id, .name = f.id, .link = .library, .status = app.pluginStatus(f.id) });
+    }
+    return out.items;
+}
+
+/// How many of `items` (a host registry: each has an `owner`) `plugin` registered.
+fn countOwned(items: anytype, plugin: *sdk.Plugin) u32 {
+    var n: u32 = 0;
+    for (items) |item| n += @intFromBool(item.owner == plugin);
+    return n;
+}
+
+/// The `plugins` service over this app (`pluginStatus`, `pluginList`); register it once `app` is
+/// at its final address.
 pub fn pluginsService(app: *App) sdk.services.plugins.Api {
     const Impl = struct {
         fn status(ctx: *anyopaque, id: []const u8) sdk.services.plugins.Api.Status {
             const a: *App = @ptrCast(@alignCast(ctx));
             return a.pluginStatus(id);
         }
-        const vtable: sdk.services.plugins.Api.VTable = .{ .status = status };
+        fn list(ctx: *anyopaque, arena: std.mem.Allocator) error{OutOfMemory}![]sdk.services.plugins.Api.Info {
+            const a: *App = @ptrCast(@alignCast(ctx));
+            return a.pluginList(arena);
+        }
+        const vtable: sdk.services.plugins.Api.VTable = .{ .status = status, .list = list };
     };
     return .{ .ctx = app, .vtable = &Impl.vtable };
 }
@@ -830,24 +886,37 @@ pub fn themeFilenameToName(trimmed: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Human-readable, actionable explanation for a `PluginLoader.LoadError`.
+/// Human-readable, actionable explanation for a `PluginLoader.LoadError`. The desktop and web
+/// loaders have different error sets that share a name wherever they mean the same thing, so the
+/// reasons are kept by name (`load_failure_reasons`): an error either loader gains without a
+/// reason there is a compile error, as a missing switch prong would be.
 pub fn pluginLoadFailureReason(err: PluginLoader.LoadError) []const u8 {
     return switch (err) {
-        error.AbiMismatch => "built against an incompatible Fizzy SDK — rebuild the plugin against this Fizzy build",
-        error.AbiBuildEnvMismatch => "SDK versions match, but optimize mode does not match",
-        error.SdkVersionMismatch => "requires a newer Fizzy SDK — update Fizzy or install a matching plugin build",
-        error.PluginIdMismatch => "plugin id in the dylib does not match its filename — rename the file or fix manifest.id",
-        error.DylibOpenFailed => "the plugin library could not be opened (missing file, wrong architecture, or unresolved symbols)",
-        error.RegisterRejected => "the plugin's register() was rejected (often a duplicate plugin id — a built-in or another plugin already claims it)",
-        error.AbiFingerprintSymbolMissing,
-        error.RegisterSymbolMissing,
-        error.SetGlobalsSymbolMissing,
-        error.SetDvuiContextSymbolMissing,
-        error.SetRenderBridgeSymbolMissing,
-        error.SdkVersionSymbolMissing,
-        => "the plugin is missing required entry symbols — rebuild it from a current root.zig template",
+        inline else => |e| @field(load_failure_reasons, @errorName(e)),
     };
 }
+
+const missing_symbols_reason = "the plugin is missing required entry symbols — rebuild it from a current root.zig template";
+
+const load_failure_reasons = .{
+    .AbiMismatch = "built against an incompatible Fizzy SDK — rebuild the plugin against this Fizzy build",
+    .AbiBuildEnvMismatch = "SDK versions match, but optimize mode does not match",
+    .SdkVersionMismatch = "requires a newer Fizzy SDK — update Fizzy or install a matching plugin build",
+    .PluginIdMismatch = "plugin id in the dylib does not match its filename — rename the file or fix manifest.id",
+    .DylibOpenFailed = "the plugin library could not be opened (missing file, wrong architecture, or unresolved symbols)",
+    .RegisterRejected = "the plugin's register() was rejected (often a duplicate plugin id — a built-in or another plugin already claims it)",
+    .AbiFingerprintSymbolMissing = missing_symbols_reason,
+    .RegisterSymbolMissing = missing_symbols_reason,
+    .SetGlobalsSymbolMissing = missing_symbols_reason,
+    .SetDvuiContextSymbolMissing = missing_symbols_reason,
+    .SetRenderBridgeSymbolMissing = missing_symbols_reason,
+    .SdkVersionSymbolMissing = missing_symbols_reason,
+    // The web loader's own: a linked module without an entry point, a build that cannot load
+    // plugins at all, and an allocation failing on the way.
+    .LoadFailed = missing_symbols_reason,
+    .Unsupported = "this build of Fizzy cannot load plugins",
+    .OutOfMemory = "ran out of memory while loading",
+};
 
 pub fn formatPluginProbeDetail(allocator: std.mem.Allocator, info: PluginLoader.PluginVersionInfo) ![]const u8 {
     return std.fmt.allocPrint(allocator, "plugin {d}.{d}.{d}, min SDK {d}.{d}.{d}", .{
