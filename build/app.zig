@@ -1040,6 +1040,28 @@ pub fn construct(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     test_integration_step.dependOn(&b.addRunArtifact(app_tests).step);
     check_integration_step.dependOn(&app_tests.step);
 
+    // The frame profiler's own tests (`core/profile.zig`): it publishes itself through dvui's
+    // window store and reads dvui's clock, so it is not one of the std-only roots above, and as
+    // part of the named `core` module its tests were never collected. Rooted at the file, against
+    // dvui's testing backend.
+    {
+        const profile_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("core/profile.zig"),
+        });
+        profile_module.addImport("dvui", dvui_testing_dep.module("dvui_testing"));
+        const profile_tests = b.addTest(.{
+            .name = "fizzy-profile-tests",
+            .root_module = profile_module,
+            .filters = test_filters,
+        });
+        if (target.result.os.tag == .windows) profile_tests.root_module.linkSystemLibrary("comctl32", .{});
+        profile_tests.root_module.link_libcpp = !target_is_windows_msvc;
+        test_integration_step.dependOn(&b.addRunArtifact(profile_tests).step);
+        check_integration_step.dependOn(&profile_tests.step);
+    }
+
     const check_bench_step = b.step("check-bench", "Compile all benchmark targets without running them");
 
     // `zig build bench-text` — text editor frame-cost benchmark. Its own step, never wired into
